@@ -1,13 +1,6 @@
-import unicodedata
 from urllib.parse import quote
 import bs4
-import requests
-
-
-def _slugify(text: str) -> str:
-    """Zamienia nazwę miasta na wersję URL (np. Kraków -> krakow)."""
-    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
-    return text.lower().strip().replace(' ', '-')
+from curl_cffi import requests
 
 
 def scrape_olx(
@@ -19,24 +12,19 @@ def scrape_olx(
     max_offers: int = 50,
     all_offers: bool = False
 ) -> list[dict]:
-    """Pobiera oferty z OLX z uwzględnieniem filtrów i dokładnego limitu ofert."""
-    encoded_query = quote(query.strip())
-    
-    loc_path = f"{_slugify(location)}/" if location.strip() else "oferty/"
-    base_url = f"https://www.olx.pl/{loc_path}q-{encoded_query}/"
+    clean_query = query.strip()
+    if not clean_query:
+        return []
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "pl-PL,pl;q=0.9",
-    }
+    formatted_query = clean_query.lower().replace(" ", "-")
+    loc_slug = location.strip().lower().replace(" ", "-")
+    
+    loc_path = f"{loc_slug}/" if loc_slug else "oferty/"
+    base_url = f"https://www.olx.pl/{loc_path}q-{formatted_query}/"
 
     results = []
     page = 1
-    
-    max_page_safety = 50 if all_offers else (max_offers // 40) + 3
+    max_page_safety = 30 if all_offers else (max_offers // 30) + 3
 
     while page <= max_page_safety:
         if not all_offers and len(results) >= max_offers:
@@ -53,15 +41,25 @@ def scrape_olx(
             params["search[dist]"] = distance
 
         try:
-            response = requests.get(base_url, headers=headers, params=params, timeout=10)
+            response = requests.get(
+                base_url, 
+                params=params, 
+                impersonate="chrome", 
+                timeout=12
+            )
+            print(f"[OLX] Strona {page} | Status HTTP: {response.status_code}")
+
             if response.status_code != 200:
+                print(f"[OLX] Błąd HTTP {response.status_code}. Przerywam pobieranie.")
                 break
 
             soup = bs4.BeautifulSoup(response.text, "html.parser")
-            cards = soup.find_all("div", {"data-cy": "l-card"})
+            cards = soup.select("div[data-cy='l-card'], div[data-testid='l-card']")
 
             if not cards:
-                break 
+                break
+
+            found_on_page = 0
 
             for card in cards:
                 if not all_offers and len(results) >= max_offers:
@@ -75,15 +73,15 @@ def scrape_olx(
                 link = href if href.startswith("http") else f"https://www.olx.pl{href}"
 
                 title_tag = card.find("h6") or card.find("h4") or card.find("h3")
-                title = title_tag.get_text(strip=True) if title_tag else "Brak tytułu"
+                title = title_tag.get_text(strip=True) if title_tag else ""
 
-                if not title or title == "Brak tytułu":
+                if not title or title.lower() == "brak tytułu":
                     continue
 
-                price_tag = card.find("p", {"data-testid": "ad-price"})
+                price_tag = card.find("p", {"data-testid": "ad-price"}) or card.select_one("[data-testid='ad-price']")
                 price = price_tag.get_text(strip=True) if price_tag else "Brak ceny"
 
-                location_tag = card.find("p", {"data-testid": "location-date"})
+                location_tag = card.find("p", {"data-testid": "location-date"}) or card.select_one("[data-testid='location-date']")
                 raw_location = location_tag.get_text(strip=True) if location_tag else "Brak danych"
                 loc = raw_location.split(" - ")[0] if " - " in raw_location else raw_location
 
@@ -102,11 +100,15 @@ def scrape_olx(
                     "image_url": image_url,
                     "link": link
                 })
+                found_on_page += 1
+
+            if found_on_page == 0:
+                break
 
             page += 1
 
         except Exception as e:
-            print(f"[OLX] Błąd pobierania strony {page}: {e}")
+            print(f"[OLX] Wyjątek podczas pobierania: {e}")
             break
 
     if not all_offers and len(results) > max_offers:

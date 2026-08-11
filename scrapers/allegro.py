@@ -1,6 +1,28 @@
+import re
+import time
 from urllib.parse import quote
 import bs4
-import requests
+from curl_cffi import requests
+
+
+def _clean_price_string(raw_text: str) -> str:
+    if not raw_text:
+        return "Brak ceny"
+
+    text = raw_text
+    text = re.sub(r'-\d+%', '', text)
+    text = re.sub(r'Kup\s*teraz', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'do\s*negocjacji', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'licytacja', '', text, flags=re.IGNORECASE)
+
+    matches = re.findall(r'(\d[\d\s,.]*)\s*(?:zł|PLN)', text, re.IGNORECASE)
+
+    if matches:
+        last_price = matches[-1].strip()
+        last_price = re.sub(r'\s+', ' ', last_price)
+        return f"{last_price} zł"
+
+    return "Brak ceny"
 
 
 def scrape_allegro(
@@ -12,22 +34,25 @@ def scrape_allegro(
     max_offers: int = 50,
     all_offers: bool = False
 ) -> list[dict]:
-    """Pobiera oferty z serwisu Allegro / Allegro Lokalnie z uwzględnieniem filtrów oraz limitu."""
-    encoded_query = quote(query.strip())
+    clean_query = query.strip()
+    if not clean_query:
+        return []
+
+    encoded_query = quote(clean_query)
     base_url = f"https://allegrolokalnie.pl/oferty/q/{encoded_query}"
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
+    session = requests.Session()
+    
+    # 1. Rozgrzewanie sesji (pobranie ciasteczek ze strony głównej)
+    try:
+        session.get("https://allegrolokalnie.pl/", impersonate="chrome", timeout=8)
+        time.sleep(0.5)
+    except Exception:
+        pass
 
     results = []
     page = 1
-    max_page_safety = 30 if all_offers else (max_offers // 30) + 3
+    max_page_safety = 30 if all_offers else (max_offers // 20) + 3
 
     while page <= max_page_safety:
         if not all_offers and len(results) >= max_offers:
@@ -36,6 +61,7 @@ def scrape_allegro(
         params = {}
         if page > 1:
             params["p"] = page
+            time.sleep(0.5)
         if min_price.isdigit():
             params["price_from"] = min_price
         if max_price.isdigit():
@@ -44,15 +70,39 @@ def scrape_allegro(
             params["city"] = location
 
         try:
-            response = requests.get(base_url, headers=headers, params=params, timeout=10)
+            response = session.get(
+                base_url, 
+                params=params, 
+                impersonate="chrome", 
+                timeout=12
+            )
+
+            # W przypadku 429 czekamy 3 sekundy i ponawiamy próbę
+            if response.status_code == 429:
+                print(f"[Allegro] Otrzymano status 429 na stronie {page}. Czekam 3.0s...")
+                time.sleep(3.0)
+                response = session.get(
+                    base_url, 
+                    params=params, 
+                    impersonate="chrome", 
+                    timeout=12
+                )
+
+            print(f"[Allegro] Strona {page} | Status HTTP: {response.status_code}")
+
             if response.status_code != 200:
+                print(f"[Allegro] Błąd HTTP {response.status_code}. Przerywam pobieranie.")
                 break
 
             soup = bs4.BeautifulSoup(response.text, "html.parser")
-            cards = soup.select("article.ml-offer-card, div.lc-offer-card")
+            cards = soup.find_all("article")
 
             if not cards:
-                cards = soup.find_all("article")
+                cards = soup.select("article.ml-offer-card, div.lc-offer-card, div[class*='offer-card']")
+
+            if not cards:
+                print(f"[Allegro] Brak kart na stronie {page}.")
+                break
 
             found_on_page = 0
 
@@ -60,7 +110,6 @@ def scrape_allegro(
                 if not all_offers and len(results) >= max_offers:
                     break
 
-                # Link do ogłoszenia
                 link_tag = card.find("a", href=True)
                 if not link_tag:
                     continue
@@ -68,26 +117,34 @@ def scrape_allegro(
                 href = link_tag["href"]
                 link = href if href.startswith("http") else f"https://allegrolokalnie.pl{href}"
 
-                # Tytuł
-                title_tag = card.select_one(".ml-offer-card__title, .lc-offer-card__title, h2, h3")
+                title_tag = card.select_one(".ml-offer-card__title, .lc-offer-card__title, h2, h3, [class*='title']")
                 title = title_tag.get_text(strip=True) if title_tag else ""
 
-                if not title or len(title) < 3:
+                if not title or len(title) < 2 or "Allegro Lokalnie" in title:
                     continue
 
-                # Cena
-                price_tag = card.select_one(".ml-offer-card__price, .lc-offer-card__price, span.ml-offer-card__price-value")
-                price = price_tag.get_text(strip=True) if price_tag else "Brak ceny"
+                price_tag = card.select_one(
+                    ".ml-offer-card__price, .lc-offer-card__price, "
+                    "[class*='price'], [data-testid*='price']"
+                )
 
-                # Lokalizacja
-                loc_tag = card.select_one(".ml-offer-card__location, .lc-offer-card__location")
+                if price_tag:
+                    price_copy = bs4.BeautifulSoup(str(price_tag), "html.parser")
+                    for unwanted in price_copy.select("del, s, [class*='old'], [class*='crossed']"):
+                        unwanted.decompose()
+                    price = _clean_price_string(price_copy.get_text(separator=" ", strip=True))
+                else:
+                    price = _clean_price_string(card.get_text(separator=" "))
+
+                loc_tag = card.select_one(".ml-offer-card__location, .lc-offer-card__location, [class*='location']")
                 loc = loc_tag.get_text(strip=True) if loc_tag else (location.capitalize() if location else "Polska")
 
-                # Zdjęcie
                 img_tag = card.find("img")
                 image_url = ""
                 if img_tag:
-                    image_url = img_tag.get("src") or img_tag.get("data-src") or ""
+                    image_url = img_tag.get("src") or img_tag.get("data-src") or img_tag.get("srcset") or ""
+                    if "," in image_url:
+                        image_url = image_url.split(",")[0].split()[0]
                     if image_url.startswith("//"):
                         image_url = "https:" + image_url
 
@@ -107,7 +164,7 @@ def scrape_allegro(
             page += 1
 
         except Exception as e:
-            print(f"[Allegro] Błąd podczas pobierania strony {page}: {e}")
+            print(f"[Allegro] Wyjątek podczas pobierania: {e}")
             break
 
     if not all_offers and len(results) > max_offers:

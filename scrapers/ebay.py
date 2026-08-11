@@ -1,6 +1,6 @@
-from urllib.parse import quote
+import re
 import bs4
-import requests
+from curl_cffi import requests
 
 
 def scrape_ebay(
@@ -12,96 +12,142 @@ def scrape_ebay(
     max_offers: int = 50,
     all_offers: bool = False
 ) -> list[dict]:
-    """Pobiera oferty z serwisu eBay z uwzględnieniem filtrów cenowych oraz limitu."""
-    encoded_query = quote(query.strip())
-    base_url = f"https://www.ebay.pl/sch/i.html?_nkw={encoded_query}"
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-    }
+    clean_query = query.strip()
+    if not clean_query:
+        return []
 
     results = []
-    page = 1
-    max_page_safety = 30 if all_offers else (max_offers // 50) + 3
 
-    while page <= max_page_safety:
-        if not all_offers and len(results) >= max_offers:
-            break
+    # Lista domen eBaya do ewentualnego fallbacku
+    domains = [
+        ("https://www.ebay.pl/sch/i.html", "https://www.ebay.pl/"),
+        ("https://www.ebay.com/sch/i.html", "https://www.ebay.com/")
+    ]
 
-        params = {
-            "_pgn": page,
-            "_ipg": 60,  
-        }
+    for base_url, homepage_url in domains:
+        page = 1
+        max_page_safety = 30 if all_offers else (max_offers // 30) + 3
 
-        if min_price.isdigit():
-            params["_udlo"] = min_price
-        if max_price.isdigit():
-            params["_udhi"] = max_price
+        # Tworzymy spójną sesję curl_cffi z impersonacją Google Chrome 124
+        session = requests.Session(impersonate="chrome124")
 
+        # 1. Rozgrzewamy sesję (pobieramy ciasteczka Akamai ze strony głównej)
         try:
-            response = requests.get(base_url, headers=headers, params=params, timeout=10)
-            if response.status_code != 200:
+            session.get(homepage_url, timeout=8)
+        except Exception as e:
+            print(f"[eBay] Uwaga: Błąd rozgrzewania sesji na {homepage_url}: {e}")
+
+        while page <= max_page_safety:
+            if not all_offers and len(results) >= max_offers:
                 break
 
-            soup = bs4.BeautifulSoup(response.text, "html.parser")
-            cards = soup.select("li.s-item")
+            params = {"_nkw": clean_query}
+            if page > 1:
+                params["_pgn"] = page
 
-            if not cards:
-                break
+            if min_price.isdigit():
+                params["_udlo"] = min_price
+            if max_price.isdigit():
+                params["_udhi"] = max_price
 
-            found_on_page = 0
+            headers = {
+                "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Referer": homepage_url,
+            }
 
-            for card in cards:
-                if not all_offers and len(results) >= max_offers:
+            try:
+                response = session.get(base_url, params=params, headers=headers, timeout=10)
+                print(f"[eBay] {base_url} Strona {page} | Status HTTP: {response.status_code}")
+
+                if response.status_code != 200:
+                    print(f"[eBay] Status {response.status_code} na {base_url}. Przechodzę do kolejnej domeny.")
                     break
 
-                title_tag = card.select_one(".s-item__title")
-                if not title_tag:
-                    continue
+                soup = bs4.BeautifulSoup(response.text, "html.parser")
+                cards = soup.select("li.s-item, li[class*='s-item'], li.s-card")
 
-                title = title_tag.get_text(strip=True)
-                if not title or "Shop on eBay" in title or "Otwórz ofertę" in title:
-                    continue
+                if not cards:
+                    print(f"[eBay] Brak kart s-item na stronie {page}.")
+                    break
 
-                link_tag = card.select_one("a.s-item__link")
-                if not link_tag or not link_tag.get("href"):
-                    continue
-                link = link_tag["href"].split("?")[0]
+                found_on_page = 0
 
-                price_tag = card.select_one(".s-item__price")
-                price = price_tag.get_text(strip=True) if price_tag else "Brak ceny"
+                for card in cards:
+                    if not all_offers and len(results) >= max_offers:
+                        break
 
-                loc_tag = card.select_one(".s-item__location") or card.select_one(".s-item__item-location")
-                loc = loc_tag.get_text(strip=True) if loc_tag else "Międzynarodowa"
-                if loc.lower().startswith("z: "):
-                    loc = loc[3:]
+                    # 1. Tytuł
+                    title_tag = card.select_one(".s-item__title, .s-card__title, [class*='title']")
+                    if not title_tag:
+                        continue
 
-                img_tag = card.select_one(".s-item__image-img") or card.select_one("img")
-                image_url = ""
-                if img_tag:
-                    image_url = img_tag.get("src") or img_tag.get("data-src") or ""
+                    title_soup = bs4.BeautifulSoup(str(title_tag), "html.parser")
+                    for hidden in title_soup.select(".visually-hidden, .clipped, span[class*='hidden']"):
+                        hidden.decompose()
 
-                results.append({
-                    "title": title,
-                    "price": price,
-                    "location": loc,
-                    "source": "eBY",
-                    "image_url": image_url,
-                    "link": link
-                })
-                found_on_page += 1
+                    title = title_soup.get_text(strip=True)
 
-            if found_on_page == 0:
+                    if not title or title.lower() in ["shop on ebay", "wyniki wyszukiwania", "otwórz ofertę"] or len(title) < 2:
+                        continue
+
+                    # 2. Link
+                    link_tag = card.select_one("a.s-item__link, a.su-link") or card.find("a", href=True)
+                    if not link_tag or not link_tag.get("href"):
+                        continue
+
+                    raw_href = link_tag["href"]
+                    if raw_href.startswith("/"):
+                        link = "https://www.ebay.pl" + raw_href
+                    else:
+                        link = raw_href.split("?")[0]
+
+                    # 3. Cena
+                    price = "Brak ceny"
+                    price_tag = card.select_one(".s-item__price, [class*='price']")
+                    if price_tag:
+                        raw_price = price_tag.get_text(strip=True)
+                        if raw_price:
+                            price = raw_price
+
+                    if price == "Brak ceny":
+                        card_text = card.get_text(separator=" ")
+                        match = re.search(r'(\d+[\d\s,.]*\s*(?:zł|PLN|\$|EUR|GBP))', card_text)
+                        if match:
+                            price = match.group(1).strip()
+
+                    # 4. Lokalizacja
+                    loc_tag = card.select_one(".s-item__location, .s-item__item-location, .s-card__attribute-row")
+                    loc = loc_tag.get_text(strip=True) if loc_tag else "Międzynarodowa"
+                    if loc.lower().startswith("z: "):
+                        loc = loc[3:]
+
+                    # 5. Zdjęcie
+                    img_tag = card.select_one(".s-item__image-img, img")
+                    image_url = ""
+                    if img_tag:
+                        image_url = img_tag.get("src") or img_tag.get("data-src") or ""
+
+                    results.append({
+                        "title": title,
+                        "price": price,
+                        "location": loc,
+                        "source": "EBAY",
+                        "image_url": image_url,
+                        "link": link
+                    })
+                    found_on_page += 1
+
+                if found_on_page == 0:
+                    break
+
+                page += 1
+
+            except Exception as e:
+                print(f"[eBay] Wyjątek podczas pobierania: {e}")
                 break
 
-            page += 1
-
-        except Exception as e:
-            print(f"[eBay] Błąd podczas pobierania strony {page}: {e}")
+        # Jeśli pobraliśmy oferty z pierwszej domeny, przerywamy pętlę domen
+        if len(results) > 0:
             break
 
     if not all_offers and len(results) > max_offers:

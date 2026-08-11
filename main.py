@@ -1,3 +1,4 @@
+import time
 from gui import ScraperGUI
 from scrapers.olx import scrape_olx
 from scrapers.ebay import scrape_ebay
@@ -5,15 +6,17 @@ from scrapers.allegro import scrape_allegro
 
 
 def fetch_all_offers(filters: dict) -> list[dict]:
-    """Pobiera dane z OLX, eBay oraz Allegro, a następnie łączy je w jedną listę."""
-    print(f"[MAIN] Rozpoczynam wyszukiwanie w serwisach OLX, eBay i Allegro dla: '{filters['query']}'...")
+    query = filters.get("query", "").strip()
+    print("\n" + "="*50)
+    print(f"[MAIN] WYSZUKIWANIE DLA FRAZY: '{query}'")
+    print("="*50)
 
     all_results = []
 
-    # 1. Scraper OLX
+    # 1. OLX
     try:
         olx_results = scrape_olx(
-            query=filters["query"],
+            query=query,
             min_price=filters["min_price"],
             max_price=filters["max_price"],
             location=filters["location"],
@@ -21,31 +24,17 @@ def fetch_all_offers(filters: dict) -> list[dict]:
             max_offers=filters["max_offers"],
             all_offers=filters["all_offers"]
         )
-        print(f"[MAIN] OLX zwrócił {len(olx_results)} ofert.")
+        print(f"[MAIN] OLX -> Pobrano: {len(olx_results)} ofert.")
         all_results.extend(olx_results)
     except Exception as e:
-        print(f"[MAIN] Błąd podczas pobierania z OLX: {e}")
+        print(f"[MAIN] Błąd wykonania scrapera OLX: {e}")
 
-    # 2. Scraper eBay
-    try:
-        ebay_results = scrape_ebay(
-            query=filters["query"],
-            min_price=filters["min_price"],
-            max_price=filters["max_price"],
-            location=filters["location"],
-            distance=filters["distance"],
-            max_offers=filters["max_offers"],
-            all_offers=filters["all_offers"]
-        )
-        print(f"[MAIN] eBay zwrócił {len(ebay_results)} ofert.")
-        all_results.extend(ebay_results)
-    except Exception as e:
-        print(f"[MAIN] Błąd podczas pobierania z eBay: {e}")
+    time.sleep(0.5)
 
-    # 3. Scraper Allegro
+    # 2. Allegro
     try:
         allegro_results = scrape_allegro(
-            query=filters["query"],
+            query=query,
             min_price=filters["min_price"],
             max_price=filters["max_price"],
             location=filters["location"],
@@ -53,12 +42,33 @@ def fetch_all_offers(filters: dict) -> list[dict]:
             max_offers=filters["max_offers"],
             all_offers=filters["all_offers"]
         )
-        print(f"[MAIN] Allegro zwrócił {len(allegro_results)} ofert.")
+        print(f"[MAIN] Allegro -> Pobrano: {len(allegro_results)} ofert.")
         all_results.extend(allegro_results)
     except Exception as e:
-        print(f"[MAIN] Błąd podczas pobierania z Allegro: {e}")
+        print(f"[MAIN] Błąd wykonania scrapera Allegro: {e}")
 
-    print(f"[MAIN] Łącznie pobrano {len(all_results)} ogłoszeń z 3 serwisów.")
+    time.sleep(0.5)
+
+    # 3. eBay
+    try:
+        ebay_results = scrape_ebay(
+            query=query,
+            min_price=filters["min_price"],
+            max_price=filters["max_price"],
+            location=filters["location"],
+            distance=filters["distance"],
+            max_offers=filters["max_offers"],
+            all_offers=filters["all_offers"]
+        )
+        print(f"[MAIN] eBay -> Pobrano: {len(ebay_results)} ofert.")
+        all_results.extend(ebay_results)
+    except Exception as e:
+        print(f"[MAIN] Błąd wykonania scrapera eBay: {e}")
+
+    print("="*50)
+    print(f"[MAIN] PODSUMOWANIE: Łącznie pobrano {len(all_results)} ogłoszeń.")
+    print("="*50 + "\n")
+
     return all_results
 
 
