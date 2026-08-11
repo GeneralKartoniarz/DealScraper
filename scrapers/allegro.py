@@ -1,8 +1,19 @@
 import re
 import time
+import unicodedata
 from urllib.parse import quote
 import bs4
 from curl_cffi import requests
+
+
+def _slugify(text: str) -> str:
+    """Zamienia nazwę miasta na czysty slug URL (np. 'Kraków' -> 'krakow')."""
+    if not text:
+        return ""
+    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
+    text = text.lower().strip()
+    text = re.sub(r'[^a-z0-9]+', '-', text)
+    return text.strip('-')
 
 
 def _clean_price_string(raw_text: str) -> str:
@@ -32,18 +43,23 @@ def scrape_allegro(
     location: str = "", 
     distance: str = "0", 
     max_offers: int = 50,
-    all_offers: bool = False
+    all_offers: bool = False,
+    sort_by: str = "default"
 ) -> list[dict]:
     clean_query = query.strip()
     if not clean_query:
         return []
 
     encoded_query = quote(clean_query)
-    base_url = f"https://allegrolokalnie.pl/oferty/q/{encoded_query}"
+    loc_slug = _slugify(location)
+
+    if loc_slug:
+        base_url = f"https://allegrolokalnie.pl/oferty/{loc_slug}/q/{encoded_query}"
+    else:
+        base_url = f"https://allegrolokalnie.pl/oferty/q/{encoded_query}"
 
     session = requests.Session()
     
-    # 1. Rozgrzewanie sesji (pobranie ciasteczek ze strony głównej)
     try:
         session.get("https://allegrolokalnie.pl/", impersonate="chrome", timeout=8)
         time.sleep(0.5)
@@ -62,12 +78,18 @@ def scrape_allegro(
         if page > 1:
             params["p"] = page
             time.sleep(0.5)
-        if min_price.isdigit():
+
+        if min_price.isdigit() and int(min_price) > 0:
             params["price_from"] = min_price
-        if max_price.isdigit():
+        if max_price.isdigit() and int(max_price) > 0:
             params["price_to"] = max_price
-        if location.strip():
-            params["city"] = location
+
+        if sort_by == "price_asc":
+            params["sort"] = "p"
+        elif sort_by == "price_desc":
+            params["sort"] = "pd"
+        elif sort_by == "date_desc":
+            params["sort"] = "n"
 
         try:
             response = session.get(
@@ -77,10 +99,19 @@ def scrape_allegro(
                 timeout=12
             )
 
-            # W przypadku 429 czekamy 3 sekundy i ponawiamy próbę
             if response.status_code == 429:
-                print(f"[Allegro] Otrzymano status 429 na stronie {page}. Czekam 3.0s...")
+                print(f"[Allegro] Status 429 na stronie {page}. Czekam 3.0s...")
                 time.sleep(3.0)
+                response = session.get(
+                    base_url, 
+                    params=params, 
+                    impersonate="chrome", 
+                    timeout=12
+                )
+
+            if response.status_code == 404 and loc_slug:
+                print(f"[Allegro] Miasto '{loc_slug}' dało 404. Próbuję wyszukać ogólnie bez miasta...")
+                base_url = f"https://allegrolokalnie.pl/oferty/q/{encoded_query}"
                 response = session.get(
                     base_url, 
                     params=params, 

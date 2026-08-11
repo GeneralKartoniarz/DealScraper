@@ -10,7 +10,8 @@ def scrape_ebay(
     location: str = "", 
     distance: str = "0", 
     max_offers: int = 50,
-    all_offers: bool = False
+    all_offers: bool = False,
+    sort_by: str = "default"
 ) -> list[dict]:
     clean_query = query.strip()
     if not clean_query:
@@ -18,7 +19,6 @@ def scrape_ebay(
 
     results = []
 
-    # Lista domen eBaya do ewentualnego fallbacku
     domains = [
         ("https://www.ebay.pl/sch/i.html", "https://www.ebay.pl/"),
         ("https://www.ebay.com/sch/i.html", "https://www.ebay.com/")
@@ -28,14 +28,12 @@ def scrape_ebay(
         page = 1
         max_page_safety = 30 if all_offers else (max_offers // 30) + 3
 
-        # Tworzymy spójną sesję curl_cffi z impersonacją Google Chrome 124
         session = requests.Session(impersonate="chrome124")
 
-        # 1. Rozgrzewamy sesję (pobieramy ciasteczka Akamai ze strony głównej)
         try:
             session.get(homepage_url, timeout=8)
-        except Exception as e:
-            print(f"[eBay] Uwaga: Błąd rozgrzewania sesji na {homepage_url}: {e}")
+        except Exception:
+            pass
 
         while page <= max_page_safety:
             if not all_offers and len(results) >= max_offers:
@@ -50,6 +48,15 @@ def scrape_ebay(
             if max_price.isdigit():
                 params["_udhi"] = max_price
 
+            if sort_by == "price_asc":
+                params["_sop"] = "15"
+            elif sort_by == "price_desc":
+                params["_sop"] = "16"
+            elif sort_by == "date_desc":
+                params["sort_by"] = "10"
+            elif sort_by == "dist_asc":
+                params["_sop"] = "7"
+
             headers = {
                 "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
                 "Referer": homepage_url,
@@ -60,14 +67,12 @@ def scrape_ebay(
                 print(f"[eBay] {base_url} Strona {page} | Status HTTP: {response.status_code}")
 
                 if response.status_code != 200:
-                    print(f"[eBay] Status {response.status_code} na {base_url}. Przechodzę do kolejnej domeny.")
                     break
 
                 soup = bs4.BeautifulSoup(response.text, "html.parser")
                 cards = soup.select("li.s-item, li[class*='s-item'], li.s-card")
 
                 if not cards:
-                    print(f"[eBay] Brak kart s-item na stronie {page}.")
                     break
 
                 found_on_page = 0
@@ -76,7 +81,6 @@ def scrape_ebay(
                     if not all_offers and len(results) >= max_offers:
                         break
 
-                    # 1. Tytuł
                     title_tag = card.select_one(".s-item__title, .s-card__title, [class*='title']")
                     if not title_tag:
                         continue
@@ -90,7 +94,6 @@ def scrape_ebay(
                     if not title or title.lower() in ["shop on ebay", "wyniki wyszukiwania", "otwórz ofertę"] or len(title) < 2:
                         continue
 
-                    # 2. Link
                     link_tag = card.select_one("a.s-item__link, a.su-link") or card.find("a", href=True)
                     if not link_tag or not link_tag.get("href"):
                         continue
@@ -101,7 +104,6 @@ def scrape_ebay(
                     else:
                         link = raw_href.split("?")[0]
 
-                    # 3. Cena
                     price = "Brak ceny"
                     price_tag = card.select_one(".s-item__price, [class*='price']")
                     if price_tag:
@@ -115,13 +117,18 @@ def scrape_ebay(
                         if match:
                             price = match.group(1).strip()
 
-                    # 4. Lokalizacja
-                    loc_tag = card.select_one(".s-item__location, .s-item__item-location, .s-card__attribute-row")
+                    loc_tag = card.select_one(".s-item__location, .s-item__item-location, span.s-item__location")
                     loc = loc_tag.get_text(strip=True) if loc_tag else "Międzynarodowa"
-                    if loc.lower().startswith("z: "):
-                        loc = loc[3:]
 
-                    # 5. Zdjęcie
+                    if loc.lower().startswith("z: "):
+                        loc = loc[3:].strip()
+                    elif loc.lower().startswith("ze: "):
+                        loc = loc[4:].strip()
+
+                    if re.search(r'\d+[\d\s,.]*(?:zł|PLN|\$|EUR|GBP)', loc, re.IGNORECASE) or loc == price:
+                        loc = "Międzynarodowa"
+
+                    
                     img_tag = card.select_one(".s-item__image-img, img")
                     image_url = ""
                     if img_tag:
@@ -146,7 +153,6 @@ def scrape_ebay(
                 print(f"[eBay] Wyjątek podczas pobierania: {e}")
                 break
 
-        # Jeśli pobraliśmy oferty z pierwszej domeny, przerywamy pętlę domen
         if len(results) > 0:
             break
 

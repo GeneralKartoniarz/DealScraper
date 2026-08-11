@@ -1,6 +1,40 @@
-from urllib.parse import quote
+import re
+import unicodedata
 import bs4
 from curl_cffi import requests
+
+
+def _slugify(text: str) -> str:
+    """Zamienia tekst na czysty ASCII slug URL dla OLX (np. 'Kraków' -> 'krakow', 'Łódź' -> 'lodz')."""
+    if not text:
+        return ""
+    text = text.replace('ł', 'l').replace('Ł', 'L')
+    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
+    text = text.lower().strip()
+    text = re.sub(r'[^a-z0-9]+', '-', text)
+    return text.strip('-')
+
+
+def _extract_olx_image_url(img_tag) -> str:
+    """Wyciąga prawdziwy adres URL zdjęcia z CDN OLX (apollo.olxcdn.com), omijając zaślepki Lazy Loading (data:image)."""
+    if not img_tag:
+        return ""
+
+    srcset = img_tag.get("srcset", "")
+    if srcset:
+        first_part = srcset.split(",")[0].strip().split()[0]
+        if first_part.startswith("http") or first_part.startswith("//"):
+            return "https:" + first_part if first_part.startswith("//") else first_part
+
+    data_src = img_tag.get("data-src", "")
+    if data_src and not data_src.startswith("data:"):
+        return "https:" + data_src if data_src.startswith("//") else data_src
+
+    src = img_tag.get("src", "")
+    if src and not src.startswith("data:") and "no_thumbnail" not in src:
+        return "https:" + src if src.startswith("//") else src
+
+    return ""
 
 
 def scrape_olx(
@@ -10,14 +44,15 @@ def scrape_olx(
     location: str = "", 
     distance: str = "0", 
     max_offers: int = 50,
-    all_offers: bool = False
+    all_offers: bool = False,
+    sort_by: str = "default"
 ) -> list[dict]:
     clean_query = query.strip()
     if not clean_query:
         return []
 
-    formatted_query = clean_query.lower().replace(" ", "-")
-    loc_slug = location.strip().lower().replace(" ", "-")
+    formatted_query = _slugify(clean_query)
+    loc_slug = _slugify(location)
     
     loc_path = f"{loc_slug}/" if loc_slug else "oferty/"
     base_url = f"https://www.olx.pl/{loc_path}q-{formatted_query}/"
@@ -33,12 +68,21 @@ def scrape_olx(
         params = {}
         if page > 1:
             params["page"] = page
-        if min_price.isdigit():
+        if min_price.isdigit() and int(min_price) > 0:
             params["search[filter_float_price:from]"] = min_price
-        if max_price.isdigit():
+        if max_price.isdigit() and int(max_price) > 0:
             params["search[filter_float_price:to]"] = max_price
         if distance.isdigit() and int(distance) > 0:
             params["search[dist]"] = distance
+
+        if sort_by == "price_asc":
+            params["search[order]"] = "filter_float_price:asc"
+        elif sort_by == "price_desc":
+            params["search[order]"] = "filter_float_price:desc"
+        elif sort_by == "date_desc":
+            params["search[order]"] = "created_at:desc"
+        elif sort_by == "date_asc":
+            params["search[order]"] = "created_at:asc"
 
         try:
             response = requests.get(
@@ -47,6 +91,17 @@ def scrape_olx(
                 impersonate="chrome", 
                 timeout=12
             )
+
+            if response.status_code == 404 and loc_slug:
+                print(f"[OLX] Miejscowość '{loc_slug}' nie tworzy osobnego sluga. Przejście do wyszukiwania ogólnego...")
+                base_url = f"https://www.olx.pl/oferty/q-{formatted_query}/"
+                response = requests.get(
+                    base_url, 
+                    params=params, 
+                    impersonate="chrome", 
+                    timeout=12
+                )
+
             print(f"[OLX] Strona {page} | Status HTTP: {response.status_code}")
 
             if response.status_code != 200:
@@ -54,9 +109,18 @@ def scrape_olx(
                 break
 
             soup = bs4.BeautifulSoup(response.text, "html.parser")
+            
             cards = soup.select("div[data-cy='l-card'], div[data-testid='l-card']")
+            if not cards:
+                offer_links = soup.select("a[href*='/d/oferta/'], a[href*='olx.pl/d/oferta/']")
+                cards = []
+                for link in offer_links:
+                    parent = link.find_parent("div", {"data-cy": "l-card"}) or link.find_parent("div", {"data-testid": "l-card"}) or link.find_parent("div")
+                    if parent and parent not in cards:
+                        cards.append(parent)
 
             if not cards:
+                print(f"[OLX] Brak kart ogłoszeń na stronie {page}.")
                 break
 
             found_on_page = 0
@@ -72,7 +136,7 @@ def scrape_olx(
                 href = link_tag["href"]
                 link = href if href.startswith("http") else f"https://www.olx.pl{href}"
 
-                title_tag = card.find("h6") or card.find("h4") or card.find("h3")
+                title_tag = card.find("h6") or card.find("h4") or card.find("h3") or card.select_one("[class*='title']")
                 title = title_tag.get_text(strip=True) if title_tag else ""
 
                 if not title or title.lower() == "brak tytułu":
@@ -86,11 +150,7 @@ def scrape_olx(
                 loc = raw_location.split(" - ")[0] if " - " in raw_location else raw_location
 
                 img_tag = card.find("img")
-                image_url = ""
-                if img_tag:
-                    image_url = img_tag.get("src") or img_tag.get("data-src") or ""
-                    if image_url.startswith("//"):
-                        image_url = "https:" + image_url
+                image_url = _extract_olx_image_url(img_tag)
 
                 results.append({
                     "title": title,
