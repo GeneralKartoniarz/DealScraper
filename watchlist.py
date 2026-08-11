@@ -1,8 +1,25 @@
+import hashlib
 import json
 import os
 import time
 
 WATCHLIST_FILE = "watchlist.json"
+
+
+def get_clean_url(url: str) -> str:
+    """Usuwa z linku zmienne śledzące, parametry wyszukiwania i znaki zapytania."""
+    if not url:
+        return ""
+    clean = url.split("?")[0].split("#")[0].strip().rstrip("/")
+    return clean
+
+
+def hash_link(link: str) -> str:
+    """Generuje 12-znakowy hash MD5 z czystego adresu ogłoszenia."""
+    clean = get_clean_url(link)
+    if not clean:
+        return ""
+    return hashlib.md5(clean.encode("utf-8")).hexdigest()[:12]
 
 
 class WatchlistManager:
@@ -28,8 +45,8 @@ class WatchlistManager:
         except Exception as e:
             print(f"[Watchlist] Błąd zapisu pliku: {e}")
 
-    def add_topic(self, filters: dict) -> dict:
-        """Dodaje nową frazę z filtrami do listy obserwowanych."""
+    def add_topic(self, filters: dict, initial_offers: list[dict] = None) -> dict:
+        """Dodaje wątek i zapisuje czyste kody MD5 bez śmieci URL."""
         query = filters.get("query", "").strip()
         if not query:
             return None
@@ -38,12 +55,15 @@ class WatchlistManager:
             if item["query"].lower() == query.lower():
                 return None
 
+        offers = initial_offers or []
+        seen_hashes = [hash_link(o["link"]) for o in offers if o.get("link")]
+
         new_topic = {
             "id": str(int(time.time())),
             "query": query,
             "filters": filters,
-            "seen_links": [],
-            "found_offers": []
+            "seen_links": seen_hashes[:200],
+            "found_offers": []            
         }
         self.items.append(new_topic)
         self.save_watchlist()
@@ -54,19 +74,27 @@ class WatchlistManager:
         self.items = [item for item in self.items if item["id"] != topic_id]
         self.save_watchlist()
 
-    def update_topic_offers(self, topic_id: str, new_offers: list[dict], fetched_links: list[str]):
-        """Aktualizuje historię linków (max 200) i dopisuje wyłapane nowości na początek listy podglądu."""
+    def clear_topic_offers(self, topic_id: str):
+        """Czyści listę zgromadzonych ofert dla danego wątku."""
         for item in self.items:
             if item["id"] == topic_id:
-                for link in reversed(fetched_links):
-                    if link not in item["seen_links"]:
-                        item["seen_links"].insert(0, link)
+                item["found_offers"] = []
+                break
+        self.save_watchlist()
+
+    def add_new_offers(self, topic_id: str, new_offers: list[dict]):
+        """Dopisuje unikalne nowe oferty i aktualizuje kody w pamięci."""
+        for item in self.items:
+            if item["id"] == topic_id:
+                for offer in reversed(new_offers):
+                    link = offer.get("link")
+                    if link:
+                        h = hash_link(link)
+                        if h not in item["seen_links"]:
+                            item["seen_links"].insert(0, h)
+                            item["found_offers"].insert(0, offer)
 
                 item["seen_links"] = item["seen_links"][:200]
-
-                for offer in new_offers:
-                    item["found_offers"].insert(0, offer)
-
-                item["found_offers"] = item["found_offers"][:100]
+                item["found_offers"] = item["found_offers"][:50]
                 break
         self.save_watchlist()

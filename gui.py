@@ -1,13 +1,13 @@
 import io
 import os
+import re
 import sys
 import threading
 import webbrowser
 import customtkinter as ctk
 from PIL import Image
 from curl_cffi import requests
-from watchlist import WatchlistManager
-
+from watchlist import WatchlistManager, hash_link
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
@@ -25,6 +25,26 @@ BRAND_COLORS = {
 }
 
 
+def _extract_numeric_price(price_str: str) -> float:
+    """Konwertuje tekst ceny (np. '14,99 zł', '$25.00') na liczbę float do lokalnego sortowania."""
+    if not price_str or "Brak" in price_str:
+        return float('inf')
+    
+    clean = re.sub(r'[^\d,.]', '', price_str)
+    if not clean:
+        return float('inf')
+    
+    if ',' in clean and '.' not in clean:
+        clean = clean.replace(',', '.')
+    elif ',' in clean and '.' in clean:
+        clean = clean.replace(',', '')
+        
+    try:
+        return float(clean)
+    except ValueError:
+        return float('inf')
+
+
 class ScraperGUI(ctk.CTk):
     def __init__(self, search_callback):
         super().__init__()
@@ -37,12 +57,17 @@ class ScraperGUI(ctk.CTk):
         self.is_searching = False
         self.selected_topic_id = None
 
-        self.title("DealFinder Desktop v3.0 - Monitor Okazji")
-        self.geometry("1280x850")
+        self.items_per_page = 15
+        self.raw_live_results = []   
+        self.filtered_live_results = [] 
+        self.live_current_page = 1
+        self.watchlist_current_page = 1
+
+        self.title("DealFinder Desktop v3.3 - Monitor Okazji")
+        self.geometry("1300x870")
         self.minsize(1100, 700)
         self.configure(fg_color=COLOR_BG)
 
-        # Kontener Główny - System Zakładek (Tabs)
         self.tabview = ctk.CTkTabview(
             self, 
             fg_color=COLOR_BG, 
@@ -51,28 +76,20 @@ class ScraperGUI(ctk.CTk):
             segmented_button_unselected_hover_color="#313244"
         )
         self.tabview.pack(fill="both", expand=True, padx=15, pady=10)
-        self.tabview.pack(fill="both", expand=True, padx=15, pady=10)
 
         self.tab_search = self.tabview.add("Wyszukiwarka na żywo")
         self.tab_watchlist = self.tabview.add("Stałe obserwowane")
 
-        # Budowa ekranu 1 (Wyszukiwarka)
         self._build_search_tab()
-
-        # Budowa ekranu 2 (Obserwowane)
         self._build_watchlist_tab()
-
-        # Pasek statusu
         self._build_status_bar()
-
-        # Uruchomienie timera
         self._start_timer()
 
     def _build_search_tab(self):
         header_card = ctk.CTkFrame(self.tab_search, fg_color=COLOR_CARD, corner_radius=16)
         header_card.pack(fill="x", padx=10, pady=(5, 5))
 
-        logo_label = ctk.CTkLabel(header_card, text="⚡ DealFinder", font=("Segoe UI", 20, "bold"), text_color=COLOR_ACCENT)
+        logo_label = ctk.CTkLabel(header_card, text="DealFinder", font=("Segoe UI", 20, "bold"), text_color=COLOR_ACCENT)
         logo_label.pack(side="left", padx=20, pady=12)
 
         self.search_entry = ctk.CTkEntry(
@@ -101,7 +118,6 @@ class ScraperGUI(ctk.CTk):
         )
         self.search_button.pack(side="left", padx=5, pady=12)
 
-        # Przycisk "+ Obserwuj"
         self.watch_button = ctk.CTkButton(
             header_card, 
             text="Obserwuj wątek", 
@@ -116,10 +132,8 @@ class ScraperGUI(ctk.CTk):
         )
         self.watch_button.pack(side="right", padx=(5, 20), pady=12)
 
-        # Pasek filtrów
         self._build_filters_bar(self.tab_search)
 
-        # Lista wyników
         self.results_frame = ctk.CTkScrollableFrame(self.tab_search, fg_color="transparent", label_text="")
         self.results_frame.pack(fill="both", expand=True, padx=10, pady=5)
         self._show_empty_state(self.results_frame, "Wpisz szukaną frazę, aby wyświetlić wyniki na żywo.")
@@ -128,46 +142,76 @@ class ScraperGUI(ctk.CTk):
         filter_card = ctk.CTkFrame(parent, fg_color=COLOR_CARD, corner_radius=12)
         filter_card.pack(fill="x", padx=10, pady=(0, 10))
 
-        ctk.CTkLabel(filter_card, text="📍 Miasto:", font=("Segoe UI", 11)).pack(side="left", padx=(12, 2), pady=8)
-        self.loc_entry = ctk.CTkEntry(filter_card, placeholder_text="np. Warszawa", width=110, height=28)
-        self.loc_entry.pack(side="left", padx=(0, 8), pady=8)
+        ctk.CTkLabel(filter_card, text="Portale:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(12, 4), pady=8)
 
-        ctk.CTkLabel(filter_card, text="+km:", font=("Segoe UI", 11)).pack(side="left", padx=(4, 2), pady=8)
-        self.dist_menu = ctk.CTkOptionMenu(filter_card, values=["0", "10", "15", "30", "50", "100"], width=65, height=28)
-        self.dist_menu.pack(side="left", padx=(0, 8), pady=8)
+        self.chk_olx_var = ctk.BooleanVar(value=True)
+        self.chk_allegro_var = ctk.BooleanVar(value=True)
+        self.chk_ebay_var = ctk.BooleanVar(value=True)
 
-        ctk.CTkLabel(filter_card, text="Od (zł):", font=("Segoe UI", 11)).pack(side="left", padx=(4, 2), pady=8)
-        self.min_price_entry = ctk.CTkEntry(filter_card, placeholder_text="Min", width=60, height=28)
-        self.min_price_entry.pack(side="left", padx=(0, 6), pady=8)
+        self.chk_olx = ctk.CTkCheckBox(
+            filter_card, text="OLX", variable=self.chk_olx_var, font=("Segoe UI", 11),
+            width=55, checkbox_width=17, checkbox_height=17, command=self._apply_local_filter_and_sort
+        )
+        self.chk_olx.pack(side="left", padx=4, pady=8)
+
+        self.chk_allegro = ctk.CTkCheckBox(
+            filter_card, text="Allegro", variable=self.chk_allegro_var, font=("Segoe UI", 11),
+            width=65, checkbox_width=17, checkbox_height=17, command=self._apply_local_filter_and_sort
+        )
+        self.chk_allegro.pack(side="left", padx=4, pady=8)
+
+        self.chk_ebay = ctk.CTkCheckBox(
+            filter_card, text="eBay", variable=self.chk_ebay_var, font=("Segoe UI", 11),
+            width=55, checkbox_width=17, checkbox_height=17, command=self._apply_local_filter_and_sort
+        )
+        self.chk_ebay.pack(side="left", padx=(4, 12), pady=8)
+
+        # Filtry wyszukiwania
+        ctk.CTkLabel(filter_card, text="📍 Miasto:", font=("Segoe UI", 11)).pack(side="left", padx=(4, 2), pady=8)
+        self.loc_entry = ctk.CTkEntry(filter_card, placeholder_text="np. Warszawa", width=95, height=28)
+        self.loc_entry.pack(side="left", padx=(0, 6), pady=8)
+
+        ctk.CTkLabel(filter_card, text="Od:", font=("Segoe UI", 11)).pack(side="left", padx=(2, 2), pady=8)
+        self.min_price_entry = ctk.CTkEntry(filter_card, placeholder_text="Min", width=55, height=28)
+        self.min_price_entry.pack(side="left", padx=(0, 4), pady=8)
 
         ctk.CTkLabel(filter_card, text="Do:", font=("Segoe UI", 11)).pack(side="left", padx=(2, 2), pady=8)
-        self.max_price_entry = ctk.CTkEntry(filter_card, placeholder_text="Max", width=60, height=28)
-        self.max_price_entry.pack(side="left", padx=(0, 10), pady=8)
+        self.max_price_entry = ctk.CTkEntry(filter_card, placeholder_text="Max", width=55, height=28)
+        self.max_price_entry.pack(side="left", padx=(0, 8), pady=8)
 
-        ctk.CTkLabel(filter_card, text="Max ofert:", font=("Segoe UI", 11)).pack(side="left", padx=(4, 2), pady=8)
-        self.max_offers_entry = ctk.CTkEntry(filter_card, placeholder_text="50", width=55, height=28)
+        ctk.CTkLabel(filter_card, text="Max:", font=("Segoe UI", 11)).pack(side="left", padx=(2, 2), pady=8)
+        self.max_offers_entry = ctk.CTkEntry(filter_card, placeholder_text="50", width=45, height=28)
         self.max_offers_entry.insert(0, "50")
-        self.max_offers_entry.pack(side="left", padx=(0, 6), pady=8)
+        self.max_offers_entry.pack(side="left", padx=(0, 4), pady=8)
 
         self.all_offers_chk = ctk.CTkCheckBox(
-            filter_card, 
-            text="Wszystkie", 
-            font=("Segoe UI", 11),
-            width=75,
-            checkbox_width=17,
-            checkbox_height=17,
-            command=self._toggle_all_offers
+            filter_card, text="Wszystkie", font=("Segoe UI", 11),
+            width=70, checkbox_width=17, checkbox_height=17, command=self._toggle_all_offers
         )
         self.all_offers_chk.pack(side="left", padx=(0, 10), pady=8)
 
         ctk.CTkLabel(filter_card, text="Sortuj:", font=("Segoe UI", 11)).pack(side="left", padx=(4, 2), pady=8)
         self.sort_menu = ctk.CTkOptionMenu(
             filter_card, 
-            values=["Domyślnie", "Najtańsze", "Najdroższe", "Najnowsze", "Najstarsze", "Najbliżej", "Najdalej"], 
-            width=105, 
+            values=["Domyślnie", "Najtańsze", "Najdroższe", "Najnowsze", "Najstarsze"], 
+            width=100, 
             height=28
         )
-        self.sort_menu.pack(side="left", padx=(0, 12), pady=8)
+        self.sort_menu.pack(side="left", padx=(0, 6), pady=8)
+
+        self.sort_btn = ctk.CTkButton(
+            filter_card,
+            text="Sortuj",
+            height=28,
+            width=110,
+            corner_radius=8,
+            fg_color="#313244",
+            hover_color="#45475a",
+            text_color="#cdd6f4",
+            font=("Segoe UI", 11, "bold"),
+            command=self._apply_local_filter_and_sort
+        )
+        self.sort_btn.pack(side="left", padx=(0, 10), pady=8)
 
     def _toggle_all_offers(self):
         if self.all_offers_chk.get() == 1:
@@ -175,14 +219,42 @@ class ScraperGUI(ctk.CTk):
         else:
             self.max_offers_entry.configure(state="normal")
 
-    # --- TAB 2: Stałe Obserwowane ---
+    def _get_enabled_sources(self) -> list[str]:
+        """Zwraca listę zaznaczonych portali (np. ['OLX', 'ALLEGRO'])."""
+        sources = []
+        if self.chk_olx_var.get():
+            sources.append("OLX")
+        if self.chk_allegro_var.get():
+            sources.append("ALLEGRO")
+        if self.chk_ebay_var.get():
+            sources.append("EBAY")
+        return sources
+
+    def _apply_local_filter_and_sort(self):
+        """Sortuje i filtruje posiadane w pamięci oferty BEZ wysyłania zapytań do sieci."""
+        if not self.raw_live_results:
+            return
+
+        enabled_sources = self._get_enabled_sources()
+
+        filtered = [item for item in self.raw_live_results if item.get("source", "").upper() in enabled_sources]
+
+        sort_choice = self.sort_menu.get()
+        if sort_choice == "Najtańsze":
+            filtered.sort(key=lambda x: _extract_numeric_price(x.get("price", "")))
+        elif sort_choice == "Najdroższe":
+            filtered.sort(key=lambda x: _extract_numeric_price(x.get("price", "")), reverse=True)
+        elif sort_choice == "Najstarsze":
+            filtered.reverse()
+
+        self._display_live_results(filtered, page=1)
+
     def _build_watchlist_tab(self):
         paned = ctk.CTkFrame(self.tab_watchlist, fg_color="transparent")
         paned.pack(fill="both", expand=True, padx=5, pady=5)
         paned.grid_columnconfigure(1, weight=1)
         paned.grid_rowconfigure(0, weight=1)
 
-        # Lewa kolumna: Zapisane tematy
         left_panel = ctk.CTkFrame(paned, fg_color=COLOR_CARD, corner_radius=14, width=280)
         left_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 10), pady=5)
         left_panel.grid_propagate(False)
@@ -193,12 +265,29 @@ class ScraperGUI(ctk.CTk):
         self.topics_scroll = ctk.CTkScrollableFrame(left_panel, fg_color="transparent")
         self.topics_scroll.pack(fill="both", expand=True, padx=5, pady=(0, 10))
 
-        # Prawa kolumna: Feed nowości
         right_panel = ctk.CTkFrame(paned, fg_color="transparent")
         right_panel.grid(row=0, column=1, sticky="nsew", pady=5)
 
-        self.watchlist_title_lbl = ctk.CTkLabel(right_panel, text="Wybierz wątek z lewej strony lub dodaj nowy", font=("Segoe UI", 15, "bold"))
-        self.watchlist_title_lbl.pack(anchor="w", padx=10, pady=(10, 5))
+        top_header_box = ctk.CTkFrame(right_panel, fg_color="transparent")
+        top_header_box.pack(fill="x", padx=10, pady=(10, 5))
+
+        self.watchlist_title_lbl = ctk.CTkLabel(top_header_box, text="Wybierz wątek z lewej strony lub dodaj nowy", font=("Segoe UI", 15, "bold"))
+        self.watchlist_title_lbl.pack(side="left")
+
+        self.clear_offers_btn = ctk.CTkButton(
+            top_header_box,
+            text="Wyczyść historię",
+            height=30,
+            width=130,
+            corner_radius=15,
+            fg_color="#313244",
+            hover_color="#45475a",
+            text_color="#cdd6f4",
+            font=("Segoe UI", 11, "bold"),
+            command=self._clear_current_watchlist_offers
+        )
+        self.clear_offers_btn.pack(side="right")
+        self.clear_offers_btn.pack_forget()
 
         self.watchlist_feed = ctk.CTkScrollableFrame(right_panel, fg_color="transparent", label_text="")
         self.watchlist_feed.pack(fill="both", expand=True)
@@ -206,7 +295,6 @@ class ScraperGUI(ctk.CTk):
         self._refresh_watchlist_sidebar()
 
     def _refresh_watchlist_sidebar(self):
-        """Przerysowuje listę wątków w lewym panelu."""
         for widget in self.topics_scroll.winfo_children():
             widget.destroy()
 
@@ -226,12 +314,12 @@ class ScraperGUI(ctk.CTk):
 
             btn_title = ctk.CTkButton(
                 item_card, 
-                text=f"🔍 {item['query']}", 
+                text=f"{item['query']}", 
                 anchor="w",
                 fg_color="transparent",
                 hover_color="#2a2a3c",
                 font=("Segoe UI", 12, "bold"),
-                command=lambda t_id=item["id"]: self._select_watchlist_topic(t_id)
+                command=lambda t_id=item["id"]: self._select_watchlist_topic(t_id, page=1)
             )
             btn_title.pack(side="left", fill="x", expand=True, padx=5, pady=5)
 
@@ -247,52 +335,95 @@ class ScraperGUI(ctk.CTk):
             )
             btn_del.pack(side="right", padx=5)
 
-    def _select_watchlist_topic(self, topic_id):
-        """Wyświetla nowości dla wybranego wątku."""
+    def _select_watchlist_topic(self, topic_id, page=1):
         self.selected_topic_id = topic_id
         topic = next((t for t in self.watchlist_mgr.items if t["id"] == topic_id), None)
         if not topic:
+            self.clear_offers_btn.pack_forget()
             return
 
-        self.watchlist_title_lbl.configure(text=f"Nowości dla wątku: '{topic['query']}' ({len(topic['found_offers'])} ofert)")
+        self.clear_offers_btn.pack(side="right")
+        offers = topic.get("found_offers", [])
+        
+        enabled_sources = self._get_enabled_sources()
+        offers = [o for o in offers if o.get("source", "").upper() in enabled_sources]
+
+        total_offers = len(offers)
+        total_pages = max(1, (total_offers + self.items_per_page - 1) // self.items_per_page)
+        
+        page = max(1, min(page, total_pages))
+        self.watchlist_current_page = page
+
+        self.watchlist_title_lbl.configure(text=f"Wyłapane nowości: '{topic['query']}' ({total_offers} ofert)")
         
         for widget in self.watchlist_feed.winfo_children():
             widget.destroy()
 
-        if not topic["found_offers"]:
-            self._show_empty_state(self.watchlist_feed, "Czekam na nowe oferty dla tego wątku...\nRobot tła sprawdzi serwisy przy kolejnym odświeżeniu!")
-        else:
-            for offer in topic["found_offers"]:
-                self._create_card(self.watchlist_feed, offer)
+        if not offers:
+            self._show_empty_state(self.watchlist_feed, "Brak nowych ofert dla tego wątku w wybranych serwisach.")
+            return
+
+        start_idx = (page - 1) * self.items_per_page
+        end_idx = start_idx + self.items_per_page
+        page_offers = offers[start_idx:end_idx]
+
+        self._render_pagination_controls(
+            self.watchlist_feed, 
+            page, 
+            total_pages, 
+            lambda p: self._select_watchlist_topic(topic_id, p)
+        )
+
+        for offer in page_offers:
+            self._create_card(self.watchlist_feed, offer)
+
+        if total_pages > 1:
+            self._render_pagination_controls(
+                self.watchlist_feed, 
+                page, 
+                total_pages, 
+                lambda p: self._select_watchlist_topic(topic_id, p)
+            )
+
+    def _clear_current_watchlist_offers(self):
+        if self.selected_topic_id:
+            self.watchlist_mgr.clear_topic_offers(self.selected_topic_id)
+            self._select_watchlist_topic(self.selected_topic_id, page=1)
 
     def _add_current_to_watchlist(self):
-        """Dodaje aktualne zapytanie z wyszukiwarki do obserwowanych."""
         query = self.search_entry.get().strip()
         if not query:
             self.status_label.configure(text="Wpisz najpierw frazę, którą chcesz obserwować!")
             return
 
         filters = self._get_current_filters()
-        added = self.watchlist_mgr.add_topic(filters)
+        self.status_label.configure(text=f"Rejestracja wątku '{query}'...")
+        threading.Thread(target=self._worker_add_watchlist, args=(filters,), daemon=True).start()
 
-        if added:
-            self.status_label.configure(text=f"✅ Dodano '{query}' do obserwowanych wątków!")
-            self._refresh_watchlist_sidebar()
-            threading.Thread(target=self._check_single_watchlist_item, args=(added,), daemon=True).start()
-        else:
-            self.status_label.configure(text=f"Wątek '{query}' jest już na liście obserwowanych.")
+    def _worker_add_watchlist(self, filters):
+        initial_results = self.search_callback(filters)
+        added = self.watchlist_mgr.add_topic(filters, initial_offers=initial_results)
+
+        def update_ui():
+            if added:
+                self.status_label.configure(text=f"Wątek '{filters['query']}' aktywny! Czekam na nowe publikacje...")
+                self._refresh_watchlist_sidebar()
+                self._select_watchlist_topic(added["id"], page=1)
+            else:
+                self.status_label.configure(text=f"Wątek '{filters['query']}' jest już na liście obserwowanych.")
+
+        self.after(0, update_ui)
 
     def _remove_from_watchlist(self, topic_id):
-        """Usuwa wątek z obserwowanych."""
         self.watchlist_mgr.remove_topic(topic_id)
         self._refresh_watchlist_sidebar()
         if self.selected_topic_id == topic_id:
             for widget in self.watchlist_feed.winfo_children():
                 widget.destroy()
             self.watchlist_title_lbl.configure(text="Wybierz wątek z lewej strony")
+            self.clear_offers_btn.pack_forget()
 
     def _get_current_filters(self):
-        """Pobiera parametry z formularza wyszukiwania."""
         query = self.search_entry.get().strip()
         is_all_offers = bool(self.all_offers_chk.get() == 1)
         raw_max = self.max_offers_entry.get().strip()
@@ -303,9 +434,7 @@ class ScraperGUI(ctk.CTk):
             "Najtańsze": "price_asc",
             "Najdroższe": "price_desc",
             "Najnowsze": "date_desc",
-            "Najstarsze": "date_asc",
-            "Najbliżej": "dist_asc",
-            "Najdalej": "dist_desc"
+            "Najstarsze": "date_asc"
         }
         sort_by = sort_map.get(self.sort_menu.get(), "default")
 
@@ -314,17 +443,21 @@ class ScraperGUI(ctk.CTk):
             "min_price": self.min_price_entry.get().strip(),
             "max_price": self.max_price_entry.get().strip(),
             "location": self.loc_entry.get().strip(),
-            "distance": self.dist_menu.get(),
             "max_offers": max_offers,
             "all_offers": is_all_offers,
-            "sort_by": sort_by
+            "sort_by": sort_by,
+            "enabled_sources": self._get_enabled_sources() 
         }
 
-    # --- OBSŁUGA WYSZUKIWANIA I MONITORINGU ---
     def trigger_search(self):
         query = self.search_entry.get().strip()
         if not query:
             self.status_label.configure(text="Wpisz frazę przed wyszukiwaniem.")
+            return
+
+        enabled = self._get_enabled_sources()
+        if not enabled:
+            self.status_label.configure(text="Zaznacz przynajmniej jeden portal (OLX / Allegro / eBay).")
             return
 
         if self.is_searching:
@@ -332,7 +465,7 @@ class ScraperGUI(ctk.CTk):
 
         self.is_searching = True
         self.search_button.configure(state="disabled", text="Szukam...")
-        self.status_label.configure(text=f"Pobieranie danych na żywo dla: '{query}'...")
+        self.status_label.configure(text=f"Pobieranie danych dla: '{query}' z [{', '.join(enabled)}]...")
         self.time_left = self.auto_refresh_seconds
 
         filters = self._get_current_filters()
@@ -340,24 +473,95 @@ class ScraperGUI(ctk.CTk):
 
     def _worker_search(self, filters):
         results = self.search_callback(filters)
-        self.after(0, self._display_live_results, results)
+        self.after(0, lambda: self._on_search_finished(results))
 
-    def _display_live_results(self, results):
+    def _on_search_finished(self, results):
+        self.raw_live_results = results
+        self._apply_local_filter_and_sort()
+        self.search_button.configure(state="normal", text="Szukaj")
+        self.is_searching = False
+
+    def _display_live_results(self, results, page=1):
+        self.filtered_live_results = results
+        total_offers = len(results)
+        total_pages = max(1, (total_offers + self.items_per_page - 1) // self.items_per_page)
+
+        page = max(1, min(page, total_pages))
+        self.live_current_page = page
+
         for widget in self.results_frame.winfo_children():
             widget.destroy()
 
         if not results:
             self._show_empty_state(self.results_frame, "Brak wyników spełniających podane kryteria.")
         else:
-            for item in results:
+            start_idx = (page - 1) * self.items_per_page
+            end_idx = start_idx + self.items_per_page
+            page_offers = results[start_idx:end_idx]
+
+            self._render_pagination_controls(
+                self.results_frame, 
+                page, 
+                total_pages, 
+                lambda p: self._display_live_results(self.filtered_live_results, p)
+            )
+
+            for item in page_offers:
                 self._create_card(self.results_frame, item)
 
-        self.status_label.configure(text=f"Znaleziono {len(results)} ofert na żywo.")
-        self.search_button.configure(state="normal", text="Szukaj")
-        self.is_searching = False
+            if total_pages > 1:
+                self._render_pagination_controls(
+                    self.results_frame, 
+                    page, 
+                    total_pages, 
+                    lambda p: self._display_live_results(self.filtered_live_results, p)
+                )
+
+        self.status_label.configure(text=f"Wyświetlono {total_offers} ofert z pobranych {len(self.raw_live_results)}.")
+
+    def _render_pagination_controls(self, parent, current_page, total_pages, on_page_change):
+        if total_pages <= 1:
+            return
+
+        p_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        p_frame.pack(fill="x", pady=6)
+
+        center_box = ctk.CTkFrame(p_frame, fg_color="#181825", corner_radius=10)
+        center_box.pack(anchor="center", padx=10, pady=2)
+
+        prev_btn = ctk.CTkButton(
+            center_box,
+            text="Poprzednia",
+            width=90,
+            height=28,
+            fg_color="#313244" if current_page > 1 else "#1e1e2e",
+            text_color="#cdd6f4" if current_page > 1 else "#585b70",
+            state="normal" if current_page > 1 else "disabled",
+            command=lambda: on_page_change(current_page - 1)
+        )
+        prev_btn.pack(side="left", padx=5, pady=4)
+
+        lbl = ctk.CTkLabel(
+            center_box,
+            text=f"Strona {current_page} z {total_pages}",
+            font=("Segoe UI", 11, "bold"),
+            text_color="#cdd6f4"
+        )
+        lbl.pack(side="left", padx=15, pady=4)
+
+        next_btn = ctk.CTkButton(
+            center_box,
+            text="Następna",
+            width=90,
+            height=28,
+            fg_color="#313244" if current_page < total_pages else "#1e1e2e",
+            text_color="#cdd6f4" if current_page < total_pages else "#585b70",
+            state="normal" if current_page < total_pages else "disabled",
+            command=lambda: on_page_change(current_page + 1)
+        )
+        next_btn.pack(side="right", padx=5, pady=4)
 
     def _check_all_watchlist_items(self):
-        """Przechodzi po wszystkich zapisanych wątkach i sprawdza nowości."""
         if not self.watchlist_mgr.items or self.is_searching:
             return
 
@@ -366,11 +570,12 @@ class ScraperGUI(ctk.CTk):
             self._check_single_watchlist_item(topic)
 
     def _check_single_watchlist_item(self, topic):
-        """Sprawdza wątek - pobiera 20 najnowszych ofert i zatrzymuje się na pierwszym znanym linku."""
+        """Szybkie sprawdzenie tła - pobiera TYLKO 15 najnowszych ofert (1 zapytanie HTTP)."""
         check_filters = dict(topic["filters"])
+        
         check_filters["sort_by"] = "date_desc"
-        check_filters["max_offers"] = 20
-        check_filters["all_offers"] = False
+        check_filters["max_offers"] = 15    
+        check_filters["all_offers"] = False 
 
         results = self.search_callback(check_filters)
         if not results:
@@ -378,36 +583,23 @@ class ScraperGUI(ctk.CTk):
 
         seen_set = set(topic["seen_links"])
 
-        if len(seen_set) == 0:
-            initial_links = [r["link"] for r in results if r.get("link")]
-            self.watchlist_mgr.update_topic_offers(topic["id"], [], initial_links)
-            return
-
         new_discovered = []
-        fetched_links = []
-
         for offer in results:
             link = offer.get("link")
-            if not link:
-                continue
-
-            fetched_links.append(link)
-            if link in seen_set:
-                break
-            else:
-                new_discovered.append(offer)
-
-        self.watchlist_mgr.update_topic_offers(topic["id"], new_discovered, fetched_links)
+            if link:
+                h = hash_link(link)
+                if h not in seen_set:
+                    new_discovered.append(offer)
 
         if new_discovered:
-            print(f"Wykryto {len(new_discovered)} nową/e ofertę/y dla: '{topic['query']}'!")
+            print(f"[WATCHLIST BROWSER] Wykryto {len(new_discovered)} nową/e ofertę/y dla: '{topic['query']}'!")
+            self.watchlist_mgr.add_new_offers(topic["id"], new_discovered)
             self.after(0, lambda: self._notify_watchlist_deals(topic["query"], new_discovered))
 
-        if self.selected_topic_id == topic["id"]:
-            self.after(0, lambda: self._select_watchlist_topic(topic["id"]))
+            if self.selected_topic_id == topic["id"]:
+                self.after(0, lambda: self._select_watchlist_topic(topic["id"], page=self.watchlist_current_page))
 
     def _notify_watchlist_deals(self, topic_query, new_offers):
-        """Wyświetla powiadomienie Toast i dźwięk dla obserwowanego wątku."""
         count = len(new_offers)
         first_offer = new_offers[0]
         title = first_offer.get("title", "Nowa oferta")
@@ -513,7 +705,6 @@ class ScraperGUI(ctk.CTk):
         open_btn.pack(anchor="e")
 
     def _load_image_async(self, image_url, target_label):
-        """Asynchroniczne pobieranie miniatury z wykorzystaniem curl_cffi i trzymaniem referencji dla GC."""
         if not image_url or image_url.startswith("data:"):
             return
 
@@ -553,7 +744,6 @@ class ScraperGUI(ctk.CTk):
         self.timer_label.pack(padx=12, pady=4)
 
     def _start_timer(self):
-        """Timer tła - co 2 minuty uruchamia sprawdzanie WSZYSTKICH obserwowanych wątków."""
         def timer_tick():
             self.time_left -= 1
             if self.time_left <= 0:
